@@ -14,6 +14,39 @@
 
 #include "CryptoContainer.h"
 
+namespace crypto
+{
+namespace utils
+{
+
+void generarate_crc32_lut(uint32_t * table)
+{
+	using crypto::container::CRC32_POLY;
+	for (unsigned i = 0; i < 256; ++i)
+	{
+		uint32_t b = i;
+		for (unsigned j = 0; j < 8; ++j)
+		{
+			if (b & 1)
+			{
+				b = (b >> 1) ^ CRC32_POLY;
+			}
+			else
+			{
+				b = (b >> 1);
+			}
+			table[i] = b;
+		}
+	}
+}
+uint32_t update_crc32(uint32_t *table, uint8_t b, uint32_t crc)
+{
+	crc = table[(crc ^ b) & 0xff];
+	return crc;
+}
+}
+}
+
 const char * TEST_FILE_NAME = "test.txt";
 const char * TEST_CONTAINER_NAME = "test-container.si";
 const char * TEST_KEY_CONTAINER_NAME = "KeyContainer.si";
@@ -31,7 +64,7 @@ enum crypt_types
 	CTR_CRYPT
 };
 
-int crypt_type = 2;
+int crypt_type = 1;
 
 int get_int(const char *question) {
 	int result;
@@ -136,6 +169,13 @@ void cryptFeistelNetwork(uint16_t &Li, uint16_t &Ri, bool uncrypt)
 	std::swap (Li, Ri);
 }
 
+void create_buffer_for_crc32(uint8_t * buffer, uint32_t word_result)
+{
+	for (unsigned k = 0; k < BLOCK_SIZE / 8; ++k) {
+		buffer[k] = (word_result >> (8 * k)) & 0xFF;
+	}
+}
+
 void increment_block(uint8_t * block, size_t sz)
 {
 	unsigned current_byte = 0;
@@ -219,17 +259,25 @@ void create_container()
 	{
 		mdf.block_count++;
 	}
+	auto file_header_pos = dst_file.tellp();
 	dst_file.write(reinterpret_cast<char*>(&mdf), FILE_METADATA_SIZE);
 	dst_file.write(TEST_FILE_NAME, name_length + 1);
 
 	uint32_t crypto_word = *((uint32_t*)IV);
+
+	uint32_t crc32 = 0;
+	uint32_t crc32_table[256];
+	crypto::utils::generarate_crc32_lut(crc32_table);
 	for (	uint64_t block = 0;
 			block < mdf.block_count;
 			++block) {
 		uint8_t buffer[BLOCK_SIZE / 8] {};
 		src_file.readsome(reinterpret_cast<char*>(&buffer[0]),
 				BLOCK_SIZE / 8);
-
+		for (unsigned k = 0; k < BLOCK_SIZE /8; ++k)
+		{
+			crc32 = crypto::utils::update_crc32(crc32_table, buffer[k], crc32);
+		}
 		switch(crypt_type)
 		{
 		case ECB_CRYPT:{
@@ -279,6 +327,9 @@ void create_container()
 		}
 
 	}
+	mdf.crc32 = crc32;
+	dst_file.seekp(file_header_pos);
+	dst_file.write(reinterpret_cast<char*>(&mdf), FILE_METADATA_SIZE);
 
 	src_file.close();
 	dst_file.close();
@@ -353,15 +404,21 @@ void extract_container()
 
 	std::ofstream dst_file;
 	dst_file.open(original_filename.c_str(), std::ios::binary);
+
 	uint32_t crypto_word = *((uint32_t*)IV);
+
+	uint32_t crc32 = 0;
+	uint32_t crc32_table[256];
+	crypto::utils::generarate_crc32_lut(crc32_table);
 	while (mdf.original_length > 0)
 	{
 		uint8_t buffer[BLOCK_SIZE / 8] {};
 		src_file.read(reinterpret_cast<char*>(&buffer[0]),
 				BLOCK_SIZE / 8);
-
 		uint64_t bytes_to_write = std::min<unsigned long>(4UL, mdf.original_length);
 
+
+		uint8_t buffer_for_crc32[BLOCK_SIZE / 8] {};
 		switch(crypt_type)
 		{
 		case ECB_CRYPT:{
@@ -369,6 +426,7 @@ void extract_container()
 			uint16_t Ri = (buffer[1] << 8) + buffer[0];
 			cryptFeistelNetwork(Li, Ri, true);
 			uint32_t encryptPart = (Li << 16) + Ri;
+			create_buffer_for_crc32(buffer_for_crc32, encryptPart);
 			dst_file.write(reinterpret_cast<char*>(&encryptPart),
 							bytes_to_write);
 			break;
@@ -381,6 +439,7 @@ void extract_container()
 			uint32_t word = (Li << 16) + Ri;
 			word = word ^ crypto_word;
 			crypto_word = crypto_word_save;
+			create_buffer_for_crc32(buffer_for_crc32, word);
 			dst_file.write(reinterpret_cast<char*>(&word),
 							bytes_to_write);
 			break;
@@ -392,8 +451,9 @@ void extract_container()
 			uint32_t result_crypto_word = (Li << 16) + Ri;
 			uint32_t word = (buffer[3] << 24) + (buffer[2] << 16) + (buffer[1] << 8) + buffer[0];
 			uint32_t result = word ^ result_crypto_word;
+			create_buffer_for_crc32(buffer_for_crc32, result);
 			dst_file.write(reinterpret_cast<char*>(&result),
-												BLOCK_SIZE /8);
+							bytes_to_write);
 			uint8_t * crypto_word_to_blocks = new uint8_t[4];
 			crypto_word_to_blocks[3] = crypto_word&0xFF;
 			crypto_word_to_blocks[2] = (crypto_word >> 8)&0xFF;
@@ -406,13 +466,25 @@ void extract_container()
 			break;
 		case RAW_CRYPT:
 		default:{
+			for (unsigned k = 0; k < BLOCK_SIZE /8; ++k)
+			{
+				buffer_for_crc32[k] = buffer[k];
+			}
 			dst_file.write(reinterpret_cast<char*>(&buffer[0]),
 							bytes_to_write);
 			break;
 		}
 		}
+		for (unsigned k = 0; k < BLOCK_SIZE /8; ++k)
+		{
+			crc32 = crypto::utils::update_crc32(crc32_table, buffer_for_crc32[k], crc32);
+		}
 
 		mdf.original_length -= bytes_to_write;
+	}
+
+	if (crc32 != mdf.crc32) {
+		std::cout << "WARNING! CRC mismatch" << std::endl;
 	}
 
 	src_file.close();
@@ -424,7 +496,7 @@ int main(int argc, char ** argv)
 {
 	for (;;) {
 		std::cout << "Меню \n"
-				"1. Зашрифровать  \n"
+				"1. Зашифровать  \n"
 				"2. Расшифровать \n"
 				"3. Создать ключ \n"
 				"4. Метод шифрования \n"
